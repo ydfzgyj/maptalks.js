@@ -3,7 +3,7 @@ import StyledVector from './StyledVector';
 import VectorPack from './VectorPack';
 import { isNil, isNumber, getAltitudeToLocal, normalizeColor } from '../style/Util';
 import clipLine from './util/clip_line';
-import { isFunctionDefinition } from '@maptalks/function-type';
+import { isFunctionDefinition, interpolated, piecewiseConstant } from '@maptalks/function-type';
 import Point from '@mapbox/point-geometry';
 import Point3 from './point3/Point3';
 import mergeLineFeatures from './util/merge_line_features';
@@ -331,8 +331,12 @@ export default class LinePack extends VectorPack {
         if (this.dasharrayFn) {
             let dasharray = this.dasharrayFn(this.options['zoom'], properties) || [0, 0, 0, 0];
             if (isFunctionDefinition(dasharray)) {
-                this.dynamicAttrs['aDasharray'] = 1;
-                dasharray = [0, 0, 0, 0];
+                // identity 属性返回的嵌套定义（{type:'interval', stops:[[10, [10, 10]], ...]}）
+                // 没有 property 键，genFnTypes 的二次求值会原样返回，这里必须自己按打包 zoom 求值
+                dasharray = evaluateNestedFunctionType(dasharray, this.options['zoom'], properties);
+                if (!Array.isArray(dasharray)) {
+                    dasharray = [0, 0, 0, 0];
+                }
             }
             if (dasharray.length < 4) {
                 const old = dasharray;
@@ -1129,6 +1133,34 @@ function hasFeatureDash(features, zoom, fn) {
         }
     }
     return false;
+}
+
+// 编译结果按定义对象缓存（同一份定义会被所有要素共享），避免逐要素 JSON 序列化
+const NESTED_FN_CACHE = new WeakMap();
+
+/**
+ * 求值「identity 属性的值本身是一个 fn-type 定义」这种嵌套定义。
+ *
+ * genFnTypes 的二次求值由 isFnTypeSymbol 门控（要求定义里有 property 键），
+ * 而 {type:'interval', stops:[[10, [10, 10]], [14, [30, 30]]]} 这类纯 zoom 分级定义没有 property，
+ * 会被原样返回到 pack 里。之前这里把它置零，结果是 aDasharray 全 0（渲染成实线，且无告警）。
+ *
+ * 注意：这里只按打包时的 zoom 求值。Vector3D 图层在缩放时不会重建 mesh，
+ * 所以分级图案本身不会随缩放刷新（要刷新需要让 aDasharray 走 fn-type 逐帧更新）。
+ *
+ * @param {Object} def 嵌套的 fn-type 定义
+ * @param {Number} zoom
+ * @param {Object} properties 要素属性
+ * @return {*} 求值结果
+ */
+function evaluateNestedFunctionType(def, zoom, properties) {
+    let fn = NESTED_FN_CACHE.get(def);
+    if (!fn) {
+        // 定义自身的 type 优先，这里只决定没有 type 时的默认求值方式
+        fn = def.type === 'exponential' ? interpolated(def) : piecewiseConstant(def);
+        NESTED_FN_CACHE.set(def, fn);
+    }
+    return fn(zoom, properties);
 }
 
 const TEMP_DIR = [];
